@@ -128,6 +128,32 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
     # Scatter updated state slots back into the pool.
+    #
+    # Only write back rows whose slot is a real block. Rows with
+    # ``slot_idx == 0`` are vLLM's NULL_BLOCK_ID (cudagraph-padding
+    # rows); the upstream FLA kernel guards its state writeback with
+    # ``if final_state_idx > 0`` and never touches slot 0. Replicating
+    # that guard here avoids two problems with the unconditional
+    # ``initial_state[slot_idx] = src_back`` scatter:
+    #   1. Polluting the reserved NULL state slot 0 with garbage
+    #      computed from padding rows.
+    #   2. Non-deterministic ``index_put_`` last-write-wins races when
+    #      multiple padding rows all map to slot 0.
     src_back = ptpu_state_buf.transpose(-1, -2).contiguous().to(initial_state.dtype)
-    initial_state[slot_idx] = src_back
+    valid = slot_idx > 0
+    if bool(valid.all()):
+        initial_state[slot_idx] = src_back
+    else:
+        initial_state[slot_idx[valid]] = src_back[valid]
+
+    # NOTE: the ``o`` rows for padding sequences (slot 0) are left as
+    # the kernel produced them and are intentionally NOT zeroed here.
+    # This matches the upstream FLA ``fused_sigmoid_gating`` wrapper,
+    # which allocates ``o`` with ``new_empty`` and whose kernel simply
+    # ``return``s on ``state_idx <= 0`` -- i.e. upstream also leaves
+    # padding output undefined. Downstream (GatedDeltaNet) slices ``o``
+    # by the actual token count and never reads padding rows, so their
+    # content has no observable effect. (The sibling packed_decode path
+    # does hard-zero its padding rows; that is a defensive superset, not
+    # a correctness requirement -- we keep FLA parity here.)
     return o, initial_state

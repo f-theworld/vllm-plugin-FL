@@ -87,8 +87,19 @@ def patch_flagcx_comm_lifecycle() -> None:
         self.available = True
         self.disabled = False
 
+        # Preserve dual-ABI support from the original PyFlagcxCommunicator:
+        # legacy FlagCX exposes ``handler`` and no ``devHandle``; its
+        # ``flagcxGetUniqueId`` returns a pointer (needs ``.contents``) and
+        # ``flagcxCommInitRank`` expects ``ctypes.pointer(unique_id)``.
+        self._legacy_unique_id_api = hasattr(self.flagcx, "handler") and not hasattr(
+            self.flagcx, "devHandle"
+        )
+
         if self.rank == 0:
-            self.unique_id = self.flagcx.flagcxGetUniqueId()
+            if self._legacy_unique_id_api:
+                self.unique_id = self.flagcx.flagcxGetUniqueId().contents
+            else:
+                self.unique_id = self.flagcx.flagcxGetUniqueId()
         else:
             self.unique_id = flagcxUniqueId()
 
@@ -116,9 +127,14 @@ def patch_flagcx_comm_lifecycle() -> None:
             return
 
         with self._device_ctx:
-            self.comm = self.flagcx.flagcxCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            if self._legacy_unique_id_api:
+                self.comm = self.flagcx.flagcxCommInitRank(
+                    self.world_size, ctypes.pointer(self.unique_id), self.rank
+                )
+            else:
+                self.comm = self.flagcx.flagcxCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
 
     def bind_comm_to_active_capture_stream(self) -> None:
         if self.disabled:

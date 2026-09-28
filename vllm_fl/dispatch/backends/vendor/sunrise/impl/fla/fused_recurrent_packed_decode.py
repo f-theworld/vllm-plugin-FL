@@ -230,7 +230,17 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         is_kda=False,
     )
     # Copy kernel output into caller buffer.
-    out.squeeze(1).copy_(o.squeeze(0))
+    out_view = out.squeeze(1)  # (B, HV, V)
+    out_view.copy_(o.squeeze(0))
+    # Zero padding rows (NULL_BLOCK_ID slots) to match the upstream FLA
+    # packed_decode kernel's ``if state_idx <= 0: store zero; return`` path.
+    # The PTPU kernel is fed ``local_indices = arange(B)`` and unconditionally
+    # writes every row (including cudagraph-padding rows whose real slot is 0),
+    # so we mask them back to zero here. Uses branchless ``torch.where`` (no
+    # data-dependent host sync -> cudagraph-capturable) and hard-zeros NaN/Inf
+    # (unlike a multiply mask where NaN*0 == NaN).
+    valid = (ssm_state_indices > 0).view(-1, *([1] * (out_view.ndim - 1)))
+    out_view.copy_(torch.where(valid, out_view, out_view.new_zeros(())))
 
     # Scatter updated state back to vLLM layout.
     transpose_scatter_to_pool(ptpu_state_buf, ssm_state_indices, initial_state)

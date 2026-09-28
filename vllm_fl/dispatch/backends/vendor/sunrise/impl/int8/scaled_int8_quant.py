@@ -43,10 +43,14 @@ def _dynamic_scaled_int8_quant_single_kernel(
     mask = cols < K
     y = tl.load(y_row + cols, mask=mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(y))
-    scale = tl.maximum(amax, eps) / scale_denom
+    # Match vLLM: scale is the raw amax/127 (NOT floored to eps). A row
+    # whose amax is 0 yields scale 0; only the reciprocal is guarded so
+    # we never divide by zero. Flooring amax to eps here would inflate the
+    # scale of tiny-but-nonzero rows and change their quantized codes.
+    scale = amax / scale_denom
     tl.store(s_ptr + row, scale)
 
-    inv_scale = 1.0 / scale
+    inv_scale = tl.where(scale > 0.0, 1.0 / scale, 0.0)
     x = y * inv_scale
     r = tl.where(x >= 0, tl.floor(x + 0.5), tl.ceil(x - 0.5))
     r = tl.minimum(tl.maximum(r, int8_min), int8_max)
@@ -79,10 +83,11 @@ def _dynamic_scaled_int8_quant_twopass_kernel(
         y = tl.load(y_row + cols, mask=mask, other=0.0).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(y)))
 
-    scale = tl.maximum(amax, eps) / scale_denom
+    # See single-load kernel: raw amax/127, guard only the reciprocal.
+    scale = amax / scale_denom
     tl.store(s_ptr + row, scale)
 
-    inv_scale = 1.0 / scale
+    inv_scale = tl.where(scale > 0.0, 1.0 / scale, 0.0)
     for off in range(0, K, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         mask = cols < K
@@ -124,10 +129,14 @@ def _dynamic_triton(x2d: torch.Tensor, eps: float):
 
 
 def _dynamic_torch(x2d: torch.Tensor, eps: float):
-    amax = x2d.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
+    # Match vLLM: raw amax/127 (no eps floor). Zero rows get scale 0; the
+    # reciprocal is guarded so tiny-but-nonzero rows keep their true scale
+    # instead of being inflated to eps (which would shrink their codes).
+    amax = x2d.abs().amax(dim=-1, keepdim=True).to(torch.float32)
     scale = amax / _SCALE_DENOM
+    inv_scale = torch.where(scale > 0, 1.0 / scale, torch.zeros_like(scale))
     q = (
-        (x2d.to(torch.float32) / scale)
+        (x2d.to(torch.float32) * inv_scale)
         .round()
         .clamp(_INT8_MIN, _INT8_MAX)
         .to(torch.int8)

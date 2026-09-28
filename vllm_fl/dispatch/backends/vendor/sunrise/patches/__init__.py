@@ -73,6 +73,14 @@ try:
 except Exception:  # pragma: no cover - defensive
     logger.exception("import-time patch_profiler.install failed")
 
+# Override MLA prefill backend selection on PTPU (0.24 MLAPrefillBackend API).
+try:
+    from . import patch_mla_prefill
+
+    patch_mla_prefill.apply_patch()
+except Exception:  # pragma: no cover - defensive
+    logger.exception("import-time patch_mla_prefill.apply_patch failed")
+
 __all__ = [
     "patch_fla_ops",
     "patch_gdn_core_attn_buf",
@@ -81,4 +89,5 @@ __all__ = [
     "patch_moe_config",
     "patch_profile_decode",
     "patch_profiler",
+    "patch_mla_prefill",
 ]

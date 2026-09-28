@@ -9,7 +9,7 @@ from typing import Callable, Optional, Union
 
 import torch
 
-from flag_gems import concat_and_cache_mla, flash_attn_varlen_func, flash_mla
+from flag_gems import concat_and_cache_mla, flash_mla
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -138,24 +138,6 @@ def torch_gather_and_maybe_dequant_cache(
     dst[:num_tokens].copy_(flat[flat_idx])
 
 
-def _ensure_mla_flash_attn_importable() -> None:
-    """MLACommonImpl.__init__ requires a module-level FA symbol.
-
-    On Sunrise/PTPU ``vllm_flash_attn`` is unavailable, so inject FlagGems'
-    varlen FA before ``super().__init__`` so the common FA prefill branch
-    can finish setup. Prefill still goes through our
-    ``_flash_attn_varlen_diff_headdims`` override.
-    """
-    import vllm.model_executor.layers.attention.mla_attention as mla_mod
-
-    if mla_mod.flash_attn_varlen_func is None:
-        mla_mod.flash_attn_varlen_func = flash_attn_varlen_func
-        logger.info_once(
-            "Sunrise MLA: injected FlagGems flash_attn_varlen_func into "
-            "mla_attention (vllm_flash_attn unavailable on PTPU)."
-        )
-
-
 class SunriseMLABackend(MLACommonBackend):
     """Sunrise-owned MLA backend entry for vendor dispatch."""
 
@@ -187,7 +169,6 @@ class SunriseMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # MLA Specific Arguments
         **mla_args,
     ) -> None:
-        _ensure_mla_flash_attn_importable()
         super().__init__(
             num_heads,
             head_size,
@@ -220,36 +201,6 @@ class SunriseMLAImpl(MLACommonImpl[MLACommonMetadata]):
             raise NotImplementedError(
                 "Sunrise MLA with FP8 KV cache not yet supported"
             )
-
-        # Prefer FlagGems FA for prefill (diff head dims + PTPU). Parent may
-        # have set CUDA FA kwargs; our override ignores self.flash_attn_varlen_func.
-        self._pad_v = True
-
-    def _flash_attn_varlen_diff_headdims(
-        self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
-    ):
-        maybe_padded_v = v
-        if self._pad_v:
-            maybe_padded_v = torch.nn.functional.pad(
-                v, [0, q.shape[-1] - v.shape[-1]], value=0
-            )
-
-        kwargs["return_softmax_lse"] = return_softmax_lse
-        attn_out = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=maybe_padded_v,
-            softmax_scale=softmax_scale,
-            **kwargs,
-        )
-
-        lse = None
-        if isinstance(attn_out, tuple):
-            attn_out, lse = attn_out[0], attn_out[1]
-
-        if return_softmax_lse:
-            return attn_out, lse
-        return attn_out
 
     def do_kv_cache_update(
         self,
