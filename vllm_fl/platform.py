@@ -282,6 +282,12 @@ class PlatformFL(Platform):
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
 
+        if getattr(cls, "vendor_name", None) == "iluvatar":
+            compilation_config.cudagraph_mm_encoder = False
+            compilation_config.use_inductor_graph_partition = True
+            _pc = getattr(compilation_config, "pass_config", None)
+            if _pc is not None:
+                _pc.fuse_rope_kvcache_cat_mla = False
         if (
             cls.device_type == "musa"
             and compilation_config.cudagraph_mode.has_full_cudagraphs()
