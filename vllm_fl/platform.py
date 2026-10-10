@@ -285,7 +285,7 @@ class PlatformFL(Platform):
             compilation_config.compile_sizes = []
 
         if (
-            cls.device_type in ("musa", "ptpu")
+            cls.device_type == "musa"
             and compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             logger.info(
