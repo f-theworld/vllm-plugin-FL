@@ -171,3 +171,76 @@ def test_kill_switch_bypasses_reuse(monkeypatch):
     out = torch.empty(4, 16)
     wrapped(layer, hs, out)
     assert called["n"] == 1
+
+
+def test_graph_mode_bypasses_reuse_entirely(monkeypatch):
+    """Under compile/graph mode the patch must be fully transparent: the proxy
+    exposes the real ``torch.zeros``, ``_intercepted_zeros`` ignores any
+    published target, and the wrapper calls ``orig`` without publishing."""
+    monkeypatch.setattr(mod, "_graph_or_compile_active", lambda: True)
+    mod._TARGET.set(None)
+
+    # 1. Proxy must hand back the *real* torch.zeros (no interception).
+    proxy = mod._GDNTorchProxy(torch)
+    assert proxy.zeros is torch.zeros, "proxy must not intercept under graph mode"
+
+    # 2. _intercepted_zeros must fall straight through even with a matching
+    #    target in the slot, and must not consume the slot.
+    sentinel = torch.full((4, 4, 8), 42.0)
+    mod._TARGET.set(((4, 4, 8), torch.float32, torch.device("cpu"), sentinel))
+    got = mod._intercepted_zeros(
+        (4, 4, 8), dtype=torch.float32, device=torch.device("cpu")
+    )
+    assert got is not sentinel, "bypass must not return the cached buffer"
+    assert torch.count_nonzero(got).item() == 0, "bypass must return a fresh zeros"
+    assert mod._TARGET.get() is not None, "bypass must not consume the target slot"
+    mod._TARGET.set(None)
+
+    # 3. Wrapper calls orig unchanged and never publishes a target.
+    layer = _make_layer()
+    called = {"n": 0}
+
+    def fake_orig(self, hs, out):
+        called["n"] += 1
+        assert mod._TARGET.get() is None
+
+    wrapped = mod._make_forward_cuda_wrapper(fake_orig)
+    wrapped(layer, torch.ones(4, 16), torch.empty(4, 16))
+    assert called["n"] == 1
+
+
+def test_wrapper_is_compile_traceable():
+    """Regression for the gb0156 graph break: with the automatic bypass, a
+    GDN-like forward that goes through the module torch proxy must trace under
+    ``torch.compile(fullgraph=True)`` and match eager output."""
+    mod._TARGET.set(None)
+    proxy = mod._GDNTorchProxy(torch)
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_v_heads = 4
+            self.tp_size = 1
+            self.head_v_dim = 8
+
+        def forward_cuda(self, hs, out):
+            n = hs.size(0)
+            buf = proxy.zeros(
+                (n, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hs.dtype,
+                device=hs.device,
+            )
+            return buf + hs.sum()
+
+    wrapped = mod._make_forward_cuda_wrapper(FakeLayer.forward_cuda)
+    layer = FakeLayer()
+    hs = torch.ones(4, 16)
+    out = torch.empty(4, 16)
+
+    def run():
+        return wrapped(layer, hs, out)
+
+    ref = run()
+    compiled = torch.compile(run, fullgraph=True, backend="eager")
+    got = compiled()
+    assert torch.equal(got, ref), "compiled output must match eager"
