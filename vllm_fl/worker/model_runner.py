@@ -2203,14 +2203,10 @@ class ModelRunnerFL(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        # GCU: native ATen rejects int64 + int64 (topsatenAdd ->
-        # TOPSATEN_STATUS_NOT_SUPPORT, hard abort). num_computed_tokens and
-        # query_pos are both bounded by max_model_len (<< 2**31), so do the
-        # add in int32 and let the slice assignment cast to positions' dtype.
         self.positions[:total_num_scheduled_tokens] = (
-            self.num_computed_tokens[req_indices_gpu]
-            + self.query_pos.gpu[:total_num_scheduled_tokens].to(torch.int32)
-        ).to(self.positions.dtype)
+            self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+            + self.query_pos.gpu[:total_num_scheduled_tokens]
+        )
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
