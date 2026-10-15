@@ -1,29 +1,47 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
-"""GCU workaround for int64 arithmetic in the shared ``ModelRunnerFL``.
+"""GCU workarounds in the shared ``ModelRunnerFL``.
 
 ``vllm_fl/worker/model_runner.py`` is the plugin's cross-vendor adaptation of
 vLLM's ``gpu_model_runner.py`` -- the same ``ModelRunnerFL`` runs on GCU, MUSA,
-Ascend and Kunlunxin -- so a GCU-only workaround does not belong in that file.
-It is applied here instead, by rewriting the single offending statement inside
-``ModelRunnerFL._prepare_inputs``::
+Ascend and Kunlunxin -- so GCU-only workarounds do not belong in that file.
+They are applied here instead, by rewriting individual statements in the shared
+runner's source at import time (keeping the shared file untouched on disk).
 
-    self.positions[:total_num_scheduled_tokens] = (
-        self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-        + self.query_pos.gpu[:total_num_scheduled_tokens]
-    )
+Two statements are rewritten:
 
-torch_gcu native ATen has no int64 ``add`` kernel for this pattern: the call
-aborts inside ``topsatenAdd`` ("This binary op pattern not support!",
-``TOPSATEN_STATUS_NOT_SUPPORT``) and takes the worker down through
-``torch_gcu/csrc/gcu/gcu_utils.cpp:74`` -- a hard abort, not a catchable
-exception.  Both operands are token positions bounded by ``max_model_len``
-(far below 2**31), so doing the add in int32 and widening on store is lossless.
+1. ``ModelRunnerFL._prepare_inputs`` -- the int64 positions add::
 
-The statement is rewritten as source text rather than by shipping a copy of the
-whole method: ``_prepare_inputs`` is ~330 lines long, and a copy kept here
-would silently rot the next time the shared runner changes.  If the statement
-stops matching, we log a warning and leave the original code in place.
+       self.positions[:total_num_scheduled_tokens] = (
+           self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+           + self.query_pos.gpu[:total_num_scheduled_tokens]
+       )
+
+   torch_gcu native ATen has no int64 ``add`` kernel for this pattern: the call
+   aborts inside ``topsatenAdd`` ("This binary op pattern not support!",
+   ``TOPSATEN_STATUS_NOT_SUPPORT``) and takes the worker down through
+   ``torch_gcu/csrc/gcu/gcu_utils.cpp:74`` -- a hard abort, not a catchable
+   exception.  Both operands are token positions bounded by ``max_model_len``
+   (far below 2**31), so doing the add in int32 and widening on store is
+   lossless.
+
+2. ``ModelRunnerFL.__init__`` -- the M-RoPE positions buffer dtype::
+
+       self.mrope_positions = self._make_buffer(
+           (3, self.max_num_tokens + 1), dtype=torch.int64
+       )
+
+   M-RoPE positions feed q/k-norm+RoPE fused kernels whose i64 indexing
+   overflows GCU300 LLVM11 register allocation under graph mode (inductor
+   cannot compile the kernel).  int32 is lossless here
+   (``max_position_embeddings`` << 2**31).  The shared file keeps the upstream
+   int64 default; on GCU we rewrite the buffer allocation to int32 so no env
+   var is required.  Other vendors keep the shared file's int64 default.
+
+Statements are rewritten as source text rather than by shipping copies of the
+whole methods, which would silently rot the next time the shared runner
+changes.  If a statement stops matching, we log a warning and leave the
+original code in place.
 """
 
 from __future__ import annotations
@@ -51,38 +69,53 @@ _REPLACEMENT = (
     "        ).to(self.positions.dtype)"
 )
 
+# The M-RoPE positions buffer allocation in ``__init__``.  The shared file keeps
+# the upstream int64 default; here we narrow it to int32 for GCU.  Anchored on
+# the whole ``self.mrope_positions = self._make_buffer(... dtype=torch.int64)``
+# call and tolerant of reformatting so a reflow of the shared file does not
+# silently disable the fix.
+_MROPE_STMT = re.compile(
+    r"self\.mrope_positions\s*=\s*self\._make_buffer\(\s*"
+    r"\(\s*3\s*,\s*self\.max_num_tokens\s*\+\s*1\s*\)\s*,\s*"
+    r"dtype\s*=\s*torch\.int64\s*,?\s*\)"
+)
 
-def apply_runner_compat_patches() -> None:
-    """Rewrite the int64 positions add in ``ModelRunnerFL``. Idempotent."""
-    try:
-        from vllm_fl.worker.model_runner import ModelRunnerFL
-    except Exception as exc:
-        logger.warning(
-            "runner_compat: ModelRunnerFL not importable (%s); the int64 "
-            "positions add is left in place",
-            exc,
-        )
+_MROPE_REPL = (
+    "self.mrope_positions = self._make_buffer(\n"
+    "                (3, self.max_num_tokens + 1), dtype=torch.int32\n"
+    "            )  # GCU: int32 M-RoPE positions (lossless, graph-compile safe)"
+)
+
+
+def _rewrite_method(cls, method_name, pattern, replacement, flag, what):
+    """Source-rewrite one method of ``cls`` in place. Idempotent via ``flag``.
+
+    Reads the live method source, applies ``pattern.subn(replacement, ...)``
+    (which must match exactly once), recompiles it against the method's own
+    globals, and rebinds it onto ``cls``.  On any miss/failure the original
+    method is left untouched and a warning is logged -- GCU-only fixes must
+    never crash the shared runner on other vendors or future refactors.
+    """
+    fn = getattr(cls, method_name, None)
+    if fn is None:
+        logger.warning("runner_compat: %s.%s missing; %s left in place",
+                        cls.__name__, method_name, what)
         return
-
-    fn = ModelRunnerFL._prepare_inputs
-    if getattr(fn, "_gcu_i32_positions", False):
+    if getattr(fn, flag, False):
         return
 
     try:
         source = textwrap.dedent(inspect.getsource(fn))
     except Exception as exc:
-        logger.warning(
-            "runner_compat: cannot read _prepare_inputs source (%s)", exc
-        )
+        logger.warning("runner_compat: cannot read %s source (%s)", method_name, exc)
         return
 
-    rewritten, matches = _STATEMENT.subn(_REPLACEMENT, source)
+    rewritten, matches = pattern.subn(replacement, source)
     if matches != 1:
         logger.warning(
-            "runner_compat: int64 positions add not found in "
-            "ModelRunnerFL._prepare_inputs (%d matches); leaving it untouched. "
-            "GCU aborts with TOPSATEN_STATUS_NOT_SUPPORT if it is reached.",
-            matches,
+            "runner_compat: %s not found in %s.%s (%d matches); leaving it "
+            "untouched.",
+            what, cls.__name__, method_name, matches,
         )
         return
 
@@ -97,16 +130,39 @@ def apply_runner_compat_patches() -> None:
             padded, inspect.getsourcefile(fn) or "<model_runner>", "exec"
         )
         exec(code, fn.__globals__, namespace)
-        patched = namespace["_prepare_inputs"]
+        patched = namespace[method_name]
     except Exception as exc:
-        logger.warning("runner_compat: rewriting _prepare_inputs failed: %s", exc)
+        logger.warning("runner_compat: rewriting %s failed: %s", method_name, exc)
         return
 
     patched.__qualname__ = fn.__qualname__
     patched.__doc__ = fn.__doc__
-    patched._gcu_i32_positions = True
-    ModelRunnerFL._prepare_inputs = patched
-    logger.info(
-        "runner_compat: rewrote the int64 positions add in "
-        "ModelRunnerFL._prepare_inputs to int32 (no int64 add kernel on GCU)"
+    setattr(patched, flag, True)
+    setattr(cls, method_name, patched)
+    logger.info("runner_compat: rewrote %s in %s.%s for GCU",
+                what, cls.__name__, method_name)
+
+
+def apply_runner_compat_patches() -> None:
+    """Apply the GCU source rewrites to ``ModelRunnerFL``. Idempotent."""
+    try:
+        from vllm_fl.worker.model_runner import ModelRunnerFL
+    except Exception as exc:
+        logger.warning(
+            "runner_compat: ModelRunnerFL not importable (%s); GCU runner "
+            "rewrites are left in place",
+            exc,
+        )
+        return
+
+    # int64 positions add -> int32 (GCU has no int64 add kernel; hard abort).
+    _rewrite_method(
+        ModelRunnerFL, "_prepare_inputs", _STATEMENT, _REPLACEMENT,
+        "_gcu_i32_positions", "the int64 positions add",
+    )
+    # M-RoPE positions buffer -> int32 by default (graph-compile safe on GCU),
+    # dropping the GCU_MROPE_INT32 env requirement.
+    _rewrite_method(
+        ModelRunnerFL, "__init__", _MROPE_STMT, _MROPE_REPL,
+        "_gcu_i32_mrope", "the M-RoPE int32 dtype default",
     )
